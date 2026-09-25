@@ -1,0 +1,61 @@
+# dsh-client-ui-approval patch: show the AI reviewer rationale as a second
+# panel line in the approval dialog.
+#
+# Applies to the STOCK bundle emitted by dsh 0.1.6-alpha.2 (and anything with
+# the same ApprovalPanel structure):
+#   <dsh>/node_modules/.pnpm/@deepseek-ai+dsh-client-ui-<hash>/node_modules/
+#     @deepseek-ai/dsh-client-ui-approval/lib/client.js
+#
+# The host plugin (this repo) sets `request.reviewContext` when the AI reviewer
+# denies an escalation and reviewDenyFallback is "ask". This patch makes the
+# browser ApprovalPanel render that context as a second, highlighted line under
+# the request reason.
+#
+# Apply (from the dsh profile dir, with `git` available):
+#   git apply /path/to/dsh-client-ui-approval.patch   (for git-tracked copies)
+#   patch -p1 < /path/to/dsh-client-ui-approval.patch (otherwise)
+#
+# Preferred: run patches/apply-ui-approval.ps1 instead — it uses exact-string
+# replacement, survives line endings and unrelated upstream refactors, and is
+# idempotent. This .patch is the human-readable record of the change.
+#
+# Base: dsh 0.1.6-alpha.2 stock ApprovalPanel bundle.
+diff --git a/lib/client.js b/lib/client.js
+--- a/lib/client.js
++++ b/lib/client.js
+@@ -23,6 +23,9 @@
+ 			"children": [{
+ 							className: ApprovalPanel_module_css_default.headline,
+ 							children: pending.reason ?? t("escalation", { toolName: pending.toolName })
++						}), pending.reviewContext !== null && pending.reviewContext !== void 0 && (0, react_jsx_runtime.jsx)("div", {
++							className: ApprovalPanel_module_css_default.review,
++							children: pending.reviewContext
+ 						}), detail !== null && (0, react_jsx_runtime.jsx)("div", {
+ 							className: ApprovalPanel_module_css_default.command,
+ 							children: detail
+@@ -132,6 +135,9 @@
+ 				this.toolName = request.toolName;
+ 				this.callId = request.callId;
+ 				this.reason = request.reason;
++				/** AI reviewer rationale shown as a second line, when present. */
++				this.reviewContext = request.reviewContext ?? null;
+ 				const completion = Promise.withResolvers();
+ 				this.result = completion.promise;
+@@ -235,6 +243,7 @@
+ 				toolName: request.toolName,
+ 				...request.callId === void 0 ? {} : { callId: request.callId },
+ 				...request.reason === void 0 ? {} : { reason: request.reason },
++				...request.reviewContext === void 0 ? {} : { reviewContext: request.reviewContext },
+ 				...request.signal === void 0 ? {} : { signal: request.signal }
+ 			});
+@@ -7,7 +7,7 @@
+-		const css = ".mna1RW_root{padding:8px calc(var(--dsh-composer-side-clearance) + 16px) 12px;flex-direction:column;align-items:center;display:flex}.mna1RW_card{width:100%;max-width:var(--dsh-chat-content-width);border:1px solid var(--dsw-alias-state-warn-secondary);background:var(--dsw-specific-input-major);box-shadow:var(--dsw-shadow-lv2);--dsh-scrollbar-thumb:var(--dsw-alias-scrollbar-bg-l2);--dsh-scrollbar-thumb-hover:var(--dsw-alias-scrollbar-hover-l2);border-radius:20px;overflow:hidden}.mna1RW_strip{background:var(--dsw-alias-state-warn-tertiary);color:var(--dsw-alias-state-warn-primary);align-items:center;gap:8px;padding:10px 16px;font-size:13px;line-height:18px;display:flex}.mna1RW_dot{corner-shape:round;background:var(--dsw-alias-state-warn-primary);border-radius:50%;width:8px;height:8px}.mna1RW_body{box-sizing:border-box;max-height:var(--dsh-composer-text-max-height);flex-direction:column;gap:6px;padding:12px 16px 0;display:flex;overflow-y:auto}.mna1RW_headline{color:var(--dsw-alias-label-primary);font-size:15px;font-weight:500;line-height:24px}.mna1RW_command{color:var(--dsw-alias-label-tertiary);font-family:var(--ds-font-family-code);word-break:break-all;font-size:13px;line-height:20px}.mna1RW_actionRow{justify-content:flex-end;gap:8px;padding:14px 16px;display:flex}.mna1RW_reject:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover-danger);color:var(--dsw-alias-state-error-primary);border-color:#0000}";
++		const css = ".mna1RW_root{padding:8px calc(var(--dsh-composer-side-clearance) + 16px) 12px;flex-direction:column;align-items:center;display:flex}.mna1RW_card{width:100%;max-width:var(--dsh-chat-content-width);border:1px solid var(--dsw-alias-state-warn-secondary);background:var(--dsw-specific-input-major);box-shadow:var(--dsw-shadow-lv2);--dsh-scrollbar-thumb:var(--dsw-alias-scrollbar-bg-l2);--dsh-scrollbar-thumb-hover:var(--dsw-alias-scrollbar-hover-l2);border-radius:20px;overflow:hidden}.mna1RW_strip{background:var(--dsw-alias-state-warn-tertiary);color:var(--dsw-alias-state-warn-primary);align-items:center;gap:8px;padding:10px 16px;font-size:13px;line-height:18px;display:flex}.mna1RW_dot{corner-shape:round;background:var(--dsw-alias-state-warn-primary);border-radius:50%;width:8px;height:8px}.mna1RW_body{box-sizing:border-box;max-height:var(--dsh-composer-text-max-height);flex-direction:column;gap:6px;padding:12px 16px 0;display:flex;overflow-y:auto}.mna1RW_headline{color:var(--dsw-alias-label-primary);font-size:15px;font-weight:500;line-height:24px;white-space:pre-wrap;word-break:break-word}.mna1RW_review{color:var(--dsw-alias-state-error-primary);background:var(--dsw-alias-state-error-tertiary);border-radius:8px;margin-top:2px;padding:8px 10px;font-size:13px;line-height:20px;white-space:pre-wrap;word-break:break-word}.mna1RW_command{color:var(--dsw-alias-label-tertiary);font-family:var(--ds-font-family-code);word-break:break-all;font-size:13px;line-height:20px}.mna1RW_actionRow{justify-content:flex-end;gap:8px;padding:14px 16px;display:flex}.mna1RW_reject:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover-danger);color:var(--dsw-alias-state-error-primary);border-color:#0000}";
+@@ -25,6 +25,7 @@
+ 			"dot": "mna1RW_dot",
+ 			"headline": "mna1RW_headline",
+ 			"reject": "mna1RW_reject",
++			"review": "mna1RW_review",
+ 			"root": "mna1RW_root",
+ 			"strip": "mna1RW_strip"
+ 		};
