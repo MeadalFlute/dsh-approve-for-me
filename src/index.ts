@@ -161,6 +161,8 @@ export const Config = z.object({
   reviewMaxAttempts: z.natural().min(1).default(2),
   /** What to do when the reviewer fails/times out: `deny` (fail closed, default) or `ask` (hand to the human). */
   reviewFallback: z.union(["deny", "ask"]).default("deny"),
+  /** What to do when the reviewer DELIBERATELY denies: `deny` (auto-reject, default) or `ask` (hand to the human with the AI's rationale shown, then report the human's verdict back to the agent). */
+  reviewDenyFallback: z.union(["deny", "ask"]).default("deny"),
   /** Consecutive reviewer denials in one turn that trip the circuit breaker (control returns to the human). */
   reviewCircuitMaxConsecutive: z.natural().default(3),
   /** Reviewer denials within the recent window that trip the circuit breaker. */
@@ -187,6 +189,7 @@ export interface ApproveForMeConfig {
   reviewTimeoutMs?: number;
   reviewMaxAttempts?: number;
   reviewFallback?: "deny" | "ask";
+  reviewDenyFallback?: "deny" | "ask";
   reviewCircuitMaxConsecutive?: number;
   reviewCircuitMaxRecent?: number;
   reviewNotify?: boolean;
@@ -363,6 +366,11 @@ export function apply(ctx: PluginContext, config: ApproveForMeConfig = {}): void
   const reviewModelLabel = config.reviewModel ?? "(agent model)";
   const reviewNotify = config.reviewNotify ?? false;
   const denialTracker: DenialTracker = createDenialTracker();
+  // Pending human-verdict reports: approvalId -> { agent, reviewText, toolLabel }.
+  // When `reviewDenyFallback: "ask"` hands a reviewer denial to the user, the
+  // plugin remembers the AI rationale; once the HUMAN decides (approval/decided),
+  // that verdict + the AI rationale is reported back to the agent.
+  const humanPending = new Map<string, { agent: Agent; reviewText: string; toolLabel: string }>();
   const strictApprovedEscalations = new WeakMap<Session, Set<string>>();
   const circuitLimits: CircuitLimits = {
     maxConsecutive: config.reviewCircuitMaxConsecutive ?? 3,
@@ -375,9 +383,61 @@ export function apply(ctx: PluginContext, config: ApproveForMeConfig = {}): void
   // idempotent and hands back a disposer, so the mode disappears with the fiber.
   ctx.effect(() => loader.registry.sandbox.addEscalationTarget(APPROVE_FOR_ME_MODE));
 
+  /**
+   * Build one reviewer user message.
+   *
+   * Prefers `loader.llm.createUserMessage` (the canonical, frozen shape) and
+   * falls back to a minimal equivalent when dsh-loader's ESM import of
+   * `@deepseek-ai/dsh-llm` failed (this profile declares no `@deepseek-ai/*`
+   * dependency, so `loader.llm.createUserMessage` throws) — provider
+   * adapters only read `role`/`content`, so the fallback is functionally
+   * identical for the reviewer call.
+   */
+  const makeUserMessage = (input: { content: unknown[]; source: Record<string, unknown> }): unknown => {
+    try {
+      return loader.llm.createUserMessage(input);
+    } catch {
+      return Object.freeze({
+        ...input,
+        role: "user",
+        id: `msg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
+      });
+    }
+  };
+
+  /**
+   * Read the session's effective permission preset.
+   *
+   * Preferred: the live permission-presets service (`current(session)`) —
+   * the SAME fold the GUI dropdown and `/permission` write and read, so a
+   * selection made there is visible to this plugin. Falls back to folding
+   * `permission/preset` from the session log directly.
+   *
+   * (The loader facade's `registry.permissionPresets.effective()` is not
+   * used: it requires an `effectivePermissionPreset` export that the host's
+   * dsh-permission-presets does not provide, so it always returned
+   * `undefined` and every preset selection was invisible to this plugin.)
+   */
+  const effectivePreset = (session: Session): string | undefined => {
+    try {
+      const service = (ctx as PluginContext & { get: (key: string) => unknown }).get("permissionPresets") as
+        | { current?: (session: Session) => string | undefined }
+        | undefined;
+      const current = service?.current?.(session);
+      if (typeof current === "string" && current !== "") return current;
+    } catch {
+      // service absent or mid-teardown: fall through to the log fold
+    }
+    let preset: string | undefined;
+    for (const event of session.events) {
+      if (event.type === "permission/preset") preset = event.data?.preset as string | undefined;
+    }
+    return preset;
+  };
+
   /** Fold the session's effective auto-approval stance. */
   const resolveState = (session: Session): { mode: Mode; presetActive: boolean; strictActive: boolean } => {
-    const preset = loader.registry.permissionPresets.effective(session.events);
+    const preset = effectivePreset(session);
     return {
       mode,
       presetActive: presetName !== "" && preset === presetName,
@@ -480,6 +540,24 @@ export function apply(ctx: PluginContext, config: ApproveForMeConfig = {}): void
     }
   };
 
+  /** Persist a reviewer FAILURE (no assessment) so the browser status node shows WHY. */
+  const appendReviewLogFailure = (req: ApprovalRequest, error: unknown): void => {
+    const session = req.agent.session;
+    const approvalId = pendingApprovalIdFor(session, req);
+    if (approvalId === undefined) return;
+    try {
+      session.append("hook/result", {
+        hook: REVIEW_HOOK,
+        approvalId,
+        riskLevel: "unknown",
+        userAuthorization: "unknown",
+        rationale: `审查失败：${errorMessage(error)}`,
+      });
+    } catch (err) {
+      ctx.logger.warn(`[approve-for-me] could not persist review failure: ${errorMessage(err)}`);
+    }
+  };
+
   /** Persist one Strict Mode status in the chat flow, independent of native approvals. */
   const appendStrictReviewLog = (
     exec: ToolExec,
@@ -534,16 +612,16 @@ export function apply(ctx: PluginContext, config: ApproveForMeConfig = {}): void
    * @param agent - the live agent whose session receives the notice.
    * @param summary - one-line terminal account shown on the collapsed row.
    * @param text - full model-facing text (defaults to `summary`).
+   * @param force - bypass the `reviewNotify` opt-in (used for rejections and
+   *   failures, where the user wants the AI's rationale visible).
    */
-  const injectReviewNotice = (agent: Agent, summary: string, text?: string): void => {
-    if (!reviewNotify) return;
+  const injectReviewNotice = (agent: Agent, summary: string, text?: string, force = false): void => {
+    if (!force && !reviewNotify) return;
     try {
-      agent.inject?.(
-        loader.llm.createUserMessage({
-          content: [{ type: "text", text: text ?? summary }],
-          source: { kind: "plugin", plugin: name, form: "notice", summary },
-        }),
-      );
+      agent.inject?.(makeUserMessage({
+        content: [{ type: "text", text: text ?? summary }],
+        source: { kind: "plugin", plugin: name, form: "notice", summary },
+      }));
     } catch {
       // session may be mid-teardown; the decision still stands
     }
@@ -602,7 +680,7 @@ export function apply(ctx: PluginContext, config: ApproveForMeConfig = {}): void
       actionJson,
     });
     const system = renderReviewSystemPrompt(config.reviewPolicy);
-    const message = loader.llm.createUserMessage({
+    const message = makeUserMessage({
       content: [{ type: "text", text: userText }],
       source: { kind: "plugin", plugin: name },
     });
@@ -800,18 +878,41 @@ export function apply(ctx: PluginContext, config: ApproveForMeConfig = {}): void
         }
         const toolLabel = `${req.toolName}${req.callId !== undefined ? ` (call ${req.callId})` : ""}`;
         let decision: string;
+        let reviewFailure: string | null = null;
         try {
           const assessment = await runReview(req);
+          if (assessment.outcome === "deny" && (config.reviewDenyFallback ?? "deny") === "ask") {
+            // Hand the decision to the human, carrying the AI's rationale so
+            // the approval panel can show it as a second line. The host UI
+            // panel (dsh-client-ui-approval) reads `req.reviewContext` and
+            // renders it under the request reason.
+            appendReviewLog(req, assessment);
+            const reviewText = [
+              `AI 审查拒绝（risk: ${assessment.riskLevel}，authorization: ${assessment.userAuthorization}）`,
+              assessment.rationale,
+            ].join("\n");
+            (req as ApprovalRequest & { reviewContext?: string }).reviewContext = reviewText;
+            const approvalId = pendingApprovalIdFor(session, req);
+            if (approvalId !== undefined) {
+              humanPending.set(String(approvalId), { agent: req.agent, reviewText, toolLabel });
+            }
+            ctx.logger.info(
+              `[approve-for-me] reviewer denied ${req.toolName} (risk=${assessment.riskLevel}, auth=${assessment.userAuthorization}); handing to human with rationale`,
+            );
+            return next();
+          }
           decision = assessment.outcome === "allow" ? "allowed-once" : "rejected";
           const verdict = decision === "allowed-once" ? "通过" : "拒绝";
           appendReviewLog(req, assessment);
-          if (reviewNotify) {
-            const summary = `⚠ 自动审查${verdict}（risk: ${assessment.riskLevel}，authorization: ${assessment.userAuthorization}）`;
-            const detail = [
-              `${summary}：${assessment.rationale}`,
-              decision === "allowed-once" ? `✔ 已批准 ${toolLabel} 的权限升级` : `✖ 已拒绝 ${toolLabel} 的权限升级`,
-            ].join("\n");
-            injectReviewNotice(req.agent, summary, detail);
+          const summary = `⚠ 自动审查${verdict}（risk: ${assessment.riskLevel}，authorization: ${assessment.userAuthorization}）`;
+          const detail = [
+            `${summary}：${assessment.rationale}`,
+            decision === "allowed-once" ? `✔ 已批准 ${toolLabel} 的权限升级` : `✖ 已拒绝 ${toolLabel} 的权限升级`,
+          ].join("\n");
+          if (decision === "rejected" || reviewNotify) {
+            // Rejections always surface the AI's rationale; approvals stay
+            // gated behind reviewNotify to avoid noise.
+            injectReviewNotice(req.agent, summary, detail, decision === "rejected");
           }
           ctx.logger.info(
             `[approve-for-me] reviewer ${assessment.outcome === "allow" ? "approved" : "denied"} ${req.toolName} (risk=${assessment.riskLevel}, auth=${assessment.userAuthorization}, rationale=${assessment.rationale})`,
@@ -822,16 +923,22 @@ export function apply(ctx: PluginContext, config: ApproveForMeConfig = {}): void
             return "cancelled";
           }
           ctx.logger.warn(`[approve-for-me] review failed: ${errorMessage(error)}`);
-          if (reviewNotify) {
-            injectReviewNotice(
-              req.agent,
-              `⚠ 自动审查失败（${errorMessage(error)}）→ ${(config.reviewFallback ?? "deny") === "ask" ? "已转交人工审批" : "已拒绝（fail-closed）"}`,
-            );
+          if ((config.reviewFallback ?? "deny") === "ask") {
+            // Handing control to the human: tell them WHY the reviewer could
+            // not decide, so the prompt is not a blind ask.
+            const failureText = `⚠ 自动审查失败（${errorMessage(error)}），已转交人工审批。`;
+            appendReviewLogFailure(req, error);
+            injectReviewNotice(req.agent, failureText, `${failureText} 若您批准，该操作将以原生审批通过执行。`, true);
+            return next();
           }
-          if ((config.reviewFallback ?? "deny") === "ask") return next();
+          reviewFailure = errorMessage(error);
           decision = "rejected";
         }
         if (decision === "rejected") {
+          if (reviewFailure !== null) {
+            const failureText = `⚠ 自动审查失败（${reviewFailure}），已拒绝（fail-closed）。`;
+            injectReviewNotice(req.agent, failureText, failureText, true);
+          }
           if (denialTracker.record(key, turn, true, circuitLimits) === "tripped") {
             ctx.logger.warn("[approve-for-me] review circuit breaker tripped by repeated denials; handing this approval to the human");
             return next();
@@ -857,6 +964,33 @@ export function apply(ctx: PluginContext, config: ApproveForMeConfig = {}): void
         `[approve-for-me] ${decision === "allowed-once" ? "approved" : "rejected"} ${req.toolName}${req.callId !== undefined ? ` (call ${req.callId})` : ""} (mode=${state.mode}${state.presetActive ? ", preset=approve-for-me" : ""})`,
       );
       return decision;
+    },
+    { prepend: true },
+  );
+
+  // Report the HUMAN's verdict back to the agent for approvals the plugin
+  // handed over with an AI rationale (reviewDenyFallback: "ask"). The audit
+  // pair is approval/asked + approval/decided; the decided event carries the
+  // same id and the final outcome.
+  ctx.on(
+    "approval/decided",
+    (event: { data?: { id?: unknown; outcome?: unknown } }) => {
+      const id = String(event?.data?.id ?? "");
+      const pending = id !== "" ? humanPending.get(id) : undefined;
+      if (pending === undefined) return;
+      humanPending.delete(id);
+      const outcome = event?.data?.outcome ?? "unavailable";
+      const verdict = outcome === "allowed-once" ? "已批准" : outcome === "rejected" ? "已拒绝" : `已结算（${outcome}）`;
+      const summary = `人工${verdict}（此前 AI 审查拒绝，${pending.toolLabel}）`;
+      const detail = [
+        summary,
+        "—— AI 审查拒绝理由 ——",
+        pending.reviewText,
+        `—— 你的最终决定：${verdict} ——`,
+        outcome === "allowed-once" ? "该操作已按你的批准执行。" : "该操作未执行。",
+      ].join("\n");
+      injectReviewNotice(pending.agent, summary, detail, true);
+      ctx.logger.info(`[approve-for-me] human ${outcome} on AI-denied ${pending.toolLabel}; rationale reported to agent`);
     },
     { prepend: true },
   );
